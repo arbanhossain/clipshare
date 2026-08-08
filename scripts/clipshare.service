@@ -1,0 +1,13 @@
+[Unit]
+Description=Clipshare clipboard history sync
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@PYTHON@ -m clipshare daemon
+WorkingDirectory=@DIR@
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
