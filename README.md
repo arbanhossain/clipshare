@@ -18,17 +18,24 @@ second — and every copy is kept in a searchable local history on each machine.
 ## Requirements
 
 - Python 3.10+ with `tkinter` (Debian/Ubuntu: `sudo apt install python3-tk`)
-- X11: nothing extra for text; `xclip` for image copy-back
-- Wayland: `wl-clipboard` (`sudo apt install wl-clipboard`)
+- X11: nothing extra for text; **`xclip` for images** (`sudo apt install xclip`) —
+  Tk cannot read or write binary clipboard targets, so without it images are
+  neither captured nor pasted
+- Wayland: `wl-clipboard` (`sudo apt install wl-clipboard`) for text and images
+- `clipshare status` prints whether image support is active on this machine
 - Tray icon: `pystray` + `pillow` (installed by `scripts/install.sh`)
 
 ## Quick start (on each laptop)
 
 ```bash
 git clone <this repo> clipshare && cd clipshare
-./scripts/install.sh          # installs deps + starts the systemd user service
-python3 -m clipshare status   # shows your token and listen port
+./scripts/install.sh   # installs the package + starts the systemd user service
+clipshare status       # shows your token, listen port, and image support
 ```
+
+`install.sh` links the `clipshare` command into `~/.local/bin`, so that
+directory has to be on your `PATH`; otherwise call
+`~/.local/share/clipshare/venv/bin/clipshare` directly.
 
 Then pair the machines once (they share one token):
 
@@ -48,6 +55,18 @@ restarts. No need to configure the same thing on both machines.
 Copy something on either laptop and it appears on the other. Discovery (UDP
 broadcast on port 58322) can even skip the `peers add` step entirely when both
 machines run with discovery on; TCP sync runs on port 58321.
+
+## Graphical setup
+
+Everything can be configured from the GUI — no terminal needed after install:
+
+1. Launch the app: `clipshare app` (first launch shows a setup wizard)
+2. Open **Settings** (toolbar button or tray menu)
+3. On both laptops set the same token (Copy / Paste / Regenerate buttons), then
+   add the other laptop's IP under **Peers** and hit **Save** — sync applies
+   immediately, no restart required
+
+The tray menu also offers **Settings** while the app runs in the background.
 
 ## Usage
 

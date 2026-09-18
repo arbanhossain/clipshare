@@ -23,14 +23,13 @@ def _print_items(items: list[dict]) -> None:
 
 
 def run_app(show_window: bool) -> int:
-    import tkinter as tk
-
-    from .clipboard import Clipboard
+    from .settings import SetupDialog
     from .tray import Tray
     from .ui import ClipshareUI, ClipboardWatcher
 
     config = Config.load()
     store = Store(config.db_path)
+    ui = ClipshareUI(config, store)
 
     def on_local_clip(clip):
         is_new, item_id = store.add(clip.kind, clip.payload, config.device_name)
@@ -39,14 +38,15 @@ def run_app(show_window: bool) -> int:
             manager.broadcast(item)
             ui.events.put(("local", item))
 
-    root = tk.Tk()
-    clipboard = Clipboard(root, config.max_image_bytes)
-    ui = ClipshareUI(config, store, clipboard)
+    hint = ui.clipboard.image_help()
+    if hint:
+        logging.warning("image clipboard unavailable — %s", hint)
+
     manager = SyncManager(config, store, on_remote_item=ui.handle_remote_item)
     ui.attach_manager(manager)
-    ClipboardWatcher(root, clipboard, on_local_clip, config.watch_interval_ms)
+    ClipboardWatcher(ui.root, ui.clipboard, on_local_clip, config.watch_interval_ms)
 
-    tray = Tray(ui.show_window, ui.quit)
+    tray = Tray(ui._tray_show, ui._tray_settings, ui._tray_quit)
     has_tray = tray.start()
     if has_tray:
         ui.set_tray(tray)
@@ -57,8 +57,11 @@ def run_app(show_window: bool) -> int:
                   "Showing window instead.", file=sys.stderr)
             show_window = True
         else:
-            root.withdraw()
+            ui.root.withdraw()
             ui._window_visible = False
+
+    if not config.onboarded:
+        SetupDialog(ui.root, config, ui)
 
     manager.start()
     try:
@@ -109,7 +112,10 @@ def cmd_search(args) -> int:
 
 
 def cmd_status(args) -> int:
+    from .clipboard import Clipboard
+
     config = Config.load()
+    clipboard = Clipboard(None, config.max_image_bytes)
     print(f"Device: {config.device_name} ({config.device_id})")
     print(f"Listen port: {config.port}   Discovery: {'on' if config.discover else 'off'}")
     print(f"Token: {config.token}")
@@ -117,6 +123,10 @@ def cmd_status(args) -> int:
     for p in config.peers or ["(none)"]:
         print(f"  {p}")
     print(f"Database: {config.db_path}")
+    if clipboard.image_tool:
+        print(f"Images: enabled via {clipboard.image_tool}")
+    else:
+        print(f"Images: disabled — {clipboard.image_help()}")
     return 0
 
 

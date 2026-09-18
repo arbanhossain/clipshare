@@ -15,6 +15,10 @@ from .store import Store, digest
 log = logging.getLogger("clipshare.sync")
 
 MAX_MSG_BYTES = 32 * 1024 * 1024
+# History replay batches are capped well under MAX_MSG_BYTES: base64 images
+# are ~1.33x their blob size, so a fixed item count can overrun the limit.
+MAX_BATCH_BYTES = 4 * 1024 * 1024
+MAX_BATCH_ITEMS = 50
 
 
 def encode_message(obj: dict) -> bytes:
@@ -89,6 +93,10 @@ class SyncManager:
         self._conns: set[socket.socket] = set()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._outbound: dict[str, threading.Thread] = {}
+        self._outbound_stop: dict[str, threading.Event] = {}
+        self._discovery_stop: threading.Event | None = None
+        self._discovery_threads: list[threading.Thread] = []
         self.peers: dict[str, tuple[str, str]] = {}  # device_id -> (name, label)
         self.connected: set[str] = set()
 
@@ -106,6 +114,8 @@ class SyncManager:
 
     def stop(self) -> None:
         self._stop.set()
+        self._stop_outbound()
+        self._stop_discovery()
         with self._lock:
             for s in list(self._conns):
                 try:
@@ -126,39 +136,92 @@ class SyncManager:
     # -- helpers ---------------------------------------------------
 
     def _spawn_outbound(self, addr: str) -> None:
-        t = threading.Thread(target=self._outbound_loop, args=(addr,), daemon=True)
+        with self._lock:
+            if addr in self._outbound:
+                return
+            stop_evt = threading.Event()
+            t = threading.Thread(
+                target=self._outbound_loop, args=(addr, stop_evt), daemon=True
+            )
+            self._outbound[addr] = t
+            self._outbound_stop[addr] = stop_evt
         t.start()
         self._threads.append(t)
 
     def _spawn_discovery(self) -> None:
+        with self._lock:
+            if self._discovery_stop is not None:
+                return
+            stop_evt = threading.Event()
+            self._discovery_stop = stop_evt
         for target in (self._discovery_loop, self._discovery_listener):
-            t = threading.Thread(target=target, daemon=True)
+            t = threading.Thread(target=target, args=(stop_evt,), daemon=True)
             t.start()
             self._threads.append(t)
+            with self._lock:
+                self._discovery_threads.append(t)
+
+    def _stop_outbound(self) -> None:
+        with self._lock:
+            stops = list(self._outbound_stop.values())
+            threads = list(self._outbound.values())
+            self._outbound.clear()
+            self._outbound_stop.clear()
+        for ev in stops:
+            ev.set()
+        for t in threads:
+            t.join(timeout=1)
+
+    def _stop_discovery(self) -> None:
+        with self._lock:
+            ev = self._discovery_stop
+            threads = list(self._discovery_threads)
+            self._discovery_stop = None
+            self._discovery_threads = []
+        if ev is not None:
+            ev.set()
+        for t in threads:
+            t.join(timeout=1)
+
+    def reload(self) -> None:
+        """Apply peer/discovery config changes without restarting the app."""
+        self._stop_outbound()
+        self._stop_discovery()
+        for addr in self.config.peers:
+            self._spawn_outbound(addr)
+        if self.config.discover:
+            self._spawn_discovery()
+
+    def _row_to_message(self, row: dict) -> dict | None:
+        """Build a push message, loading the image blob when the row needs it."""
+        if row["kind"] == "text":
+            return item_to_message(row)
+        full = self.store.get(row["id"])
+        if not full or not full.get("image"):
+            return None
+        return item_to_message(full)
 
     def _send_recent(self, sock: socket.socket) -> None:
         items = self.store.recent(limit=self.config.history_limit)
-        for i in range(0, len(items), 50):
-            chunk = []
-            for it in items[i : i + 50]:
-                msg = {
-                    "type": "push",
-                    "hash": it["hash"],
-                    "kind": it["kind"],
-                    "ts": it["created_at"],
-                    "source": it["source"],
-                }
-                if it["kind"] == "text":
-                    msg["text"] = it["text"]
-                else:
-                    full = self.store.get(it["id"])
-                    if full and full.get("image"):
-                        msg["image"] = base64.b64encode(full["image"]).decode("ascii")
-                    else:
-                        continue
-                chunk.append(msg)
-            if chunk:
-                send_message(sock, {"type": "items", "items": chunk})
+        batch: list[dict] = []
+        batch_bytes = 0
+        for it in items:
+            msg = self._row_to_message(it)
+            if msg is None:
+                continue
+            size = len(encode_message(msg))
+            if size > MAX_BATCH_BYTES and size + 1024 > MAX_MSG_BYTES:
+                log.warning("skipping oversized item %s (%d bytes)", it["hash"][:8], size)
+                continue
+            if batch and (
+                batch_bytes + size > MAX_BATCH_BYTES or len(batch) >= MAX_BATCH_ITEMS
+            ):
+                send_message(sock, {"type": "items", "items": batch})
+                batch, batch_bytes = [], 0
+            batch.append(msg)
+            batch_bytes += size
+        if batch:
+            send_message(sock, {"type": "items", "items": batch})
 
     def _hello(self) -> dict:
         return {
@@ -172,8 +235,8 @@ class SyncManager:
 
     # -- outbound --------------------------------------------------
 
-    def _outbound_loop(self, addr: str) -> None:
-        while not self._stop.is_set():
+    def _outbound_loop(self, addr: str, stop_evt: threading.Event) -> None:
+        while not self._stop.is_set() and not stop_evt.is_set():
             host, port = parse_peer(addr)
             label = f"out:{addr}"
             try:
@@ -195,7 +258,7 @@ class SyncManager:
                     pass
                 with self._lock:
                     self.connected.discard(label)
-            self._stop.wait(5)
+            stop_evt.wait(5)
 
     # -- inbound ---------------------------------------------------
 
@@ -335,7 +398,7 @@ class SyncManager:
 
     # -- discovery --------------------------------------------------
 
-    def _discovery_loop(self) -> None:
+    def _discovery_loop(self, stop_evt: threading.Event) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         payload = encode_message(
@@ -346,15 +409,15 @@ class SyncManager:
                 "device_id": self.config.device_id,
             }
         )
-        while not self._stop.is_set():
+        while not self._stop.is_set() and not stop_evt.is_set():
             try:
                 s.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
             except OSError:
                 pass
-            self._stop.wait(5)
+            stop_evt.wait(5)
         s.close()
 
-    def _discovery_listener(self) -> None:
+    def _discovery_listener(self, stop_evt: threading.Event) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -362,7 +425,7 @@ class SyncManager:
         except OSError:
             return
         s.settimeout(1.0)
-        while not self._stop.is_set():
+        while not self._stop.is_set() and not stop_evt.is_set():
             try:
                 data, addr = s.recvfrom(65536)
             except socket.timeout:

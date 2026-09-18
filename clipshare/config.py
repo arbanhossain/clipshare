@@ -40,6 +40,7 @@ class Config:
     token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     port: int = DEFAULT_PORT
     peers: list[str] = field(default_factory=list)
+    onboarded: bool = False
     auto_push: bool = True
     auto_add_peers: bool = True
     discover: bool = True

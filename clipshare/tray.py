@@ -22,8 +22,9 @@ def make_icon_image():
 
 
 class Tray:
-    def __init__(self, on_show, on_quit):
+    def __init__(self, on_show, on_settings, on_quit):
         self.on_show = on_show
+        self.on_settings = on_settings
         self.on_quit = on_quit
         self._icon = None
         self._thread = None
@@ -33,6 +34,7 @@ class Tray:
             return False
         menu = pystray.Menu(
             pystray.MenuItem("Show history", lambda: self.on_show()),
+            pystray.MenuItem("Settings", lambda: self.on_settings()),
             pystray.MenuItem("Quit", lambda: self.on_quit()),
         )
         self._icon = pystray.Icon("clipshare", make_icon_image(), "Clipshare", menu)

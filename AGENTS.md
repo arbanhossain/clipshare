@@ -6,10 +6,12 @@ Contributor guide for Clipshare, a Python app that syncs clipboard history
 ## Project Structure & Module Organization
 
 - `clipshare/` — application source. One module per responsibility:
-  - `clipboard.py` — X11 (tkinter) / Wayland (`wl-clipboard`) clipboard adapters
+  - `clipboard.py` — X11 (tkinter text, `xclip` images) / Wayland (`wl-clipboard`)
+    clipboard adapters; images are normalised to PNG before they reach the store
   - `store.py` — SQLite history with content-hash dedup
   - `sync.py` — TCP sync protocol, UDP discovery, peer pairing
   - `ui.py`, `tray.py` — tkinter history window and pystray tray icon
+  - `settings.py` — first-run setup wizard and settings dialog (token, peers, options)
   - `config.py`, `cli.py`, `__main__.py` — settings and entry points
 - `tests/` — `unittest` suites mirroring module names (`test_store.py`, `test_sync.py`)
 - `scripts/` — `install.sh` and the systemd unit template (`clipshare.service`)
@@ -22,7 +24,8 @@ Run from the repository root:
 - `python3 -m unittest discover -s tests -t . -v` — run the full test suite
 - `python3 -m py_compile clipshare/*.py tests/*.py` — syntax-check all modules
 - `python3 -m clipshare status` — show device, token, peers, and DB path
-- `python3 -m clipshare app` — launch the history window locally
+- `python3 -m clipshare app` — launch the history window (first run shows the setup wizard)
+- `tests/test_settings_smoke.py` — builds the GUI dialogs; skipped when headless
 - `./scripts/install.sh` — create a venv and install the systemd user service
 
 ## Coding Style & Naming Conventions

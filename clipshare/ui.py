@@ -10,6 +10,7 @@ from tkinter import ttk
 from . import __version__
 from .clipboard import Clipboard
 from .config import Config
+from .settings import SettingsDialog
 from .store import Store, digest
 from .sync import SyncManager
 
@@ -46,10 +47,9 @@ class ClipboardWatcher:
 
 
 class ClipshareUI:
-    def __init__(self, config: Config, store: Store, clipboard: Clipboard):
+    def __init__(self, config: Config, store: Store, clipboard: Clipboard | None = None):
         self.config = config
         self.store = store
-        self.clipboard = clipboard
         self.manager: SyncManager | None = None
         self.events: queue.Queue = queue.Queue()
         self._items: list[dict] = []
@@ -62,6 +62,8 @@ class ClipshareUI:
         self.root.title(f"Clipshare {__version__}")
         self.root.geometry("680x520")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.clipboard = clipboard or Clipboard(self.root, config.max_image_bytes)
+        self._action_msg = self.clipboard.image_help()
         self._build()
         self.refresh()
         self.root.after(250, self._poll_events)
@@ -69,6 +71,18 @@ class ClipshareUI:
 
     def attach_manager(self, manager: SyncManager) -> None:
         self.manager = manager
+
+    def open_settings(self) -> None:
+        SettingsDialog(self.root, self.config, self.store, self.clipboard, self.manager)
+
+    def _tray_show(self) -> None:
+        self.root.after(0, self.show_window)
+
+    def _tray_settings(self) -> None:
+        self.root.after(0, self.open_settings)
+
+    def _tray_quit(self) -> None:
+        self.root.after(0, self.quit)
 
     def handle_remote_item(self, item: dict) -> None:
         self.events.put(("remote", item))
@@ -86,6 +100,7 @@ class ClipshareUI:
         ttk.Button(top, text="Pin", command=self.toggle_pin).pack(side="left", padx=4)
         ttk.Button(top, text="Delete", command=self.delete_selected).pack(side="left", padx=4)
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="left")
+        ttk.Button(top, text="Settings", command=self.open_settings).pack(side="right")
 
         mid = ttk.Frame(self.root)
         mid.pack(fill="both", expand=True, padx=6, pady=6)
