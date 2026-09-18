@@ -15,9 +15,16 @@ fi
 
 python3 -m venv "${VENV}"
 "${VENV}/bin/pip" install --quiet --upgrade pip
-"${VENV}/bin/pip" install --quiet -r "${SRC}/requirements.txt"
+# Install the package itself, not just its deps: this is what creates the
+# `clipshare` console script declared in pyproject.toml.
+"${VENV}/bin/pip" install --quiet "${SRC}"
 
-cp -r "${SRC}/clipshare" "${DEST}/"
+# Earlier versions copied the package into DEST, which is the service's
+# WorkingDirectory — that copy shadowed the installed one and went stale.
+rm -rf "${DEST:?}/clipshare"
+
+mkdir -p "${HOME}/.local/bin"
+ln -sf "${VENV}/bin/${APP}" "${HOME}/.local/bin/${APP}"
 
 SERVICE_DIR="${HOME}/.config/systemd/user"
 mkdir -p "${SERVICE_DIR}"
@@ -30,4 +37,10 @@ systemctl --user enable --now clipshare.service
 
 echo
 echo "Installed. Check status with:  systemctl --user status clipshare"
-echo "Open the history window with:  ${VENV}/bin/python -m clipshare app"
+echo "Then:                          clipshare status"
+echo "Open the history window with:  clipshare app"
+if ! command -v "${APP}" >/dev/null; then
+    echo
+    echo "Note: ${HOME}/.local/bin is not on your PATH — add it, or run"
+    echo "      ${VENV}/bin/${APP} instead."
+fi
