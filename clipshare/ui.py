@@ -15,6 +15,9 @@ from .store import Store, digest
 from .sync import SyncManager
 
 
+PRUNE_INTERVAL_MS = 15 * 60 * 1000
+
+
 def format_time(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
 
@@ -39,10 +42,11 @@ class ClipboardWatcher:
                 clip.digest = digest(clip.payload)
             if clip.digest != self.last_digest:
                 self.last_digest = clip.digest
-                try:
-                    self.on_change(clip)
-                except Exception:
-                    pass
+                if not self.clipboard.is_echo(clip.digest):
+                    try:
+                        self.on_change(clip)
+                    except Exception:
+                        pass
         self.root.after(self.interval_ms, self._poll)
 
 
@@ -68,6 +72,7 @@ class ClipshareUI:
         self.refresh()
         self.root.after(250, self._poll_events)
         self.root.after(2000, self._poll_status)
+        self.root.after(5000, self._poll_prune)
 
     def attach_manager(self, manager: SyncManager) -> None:
         self.manager = manager
@@ -221,6 +226,18 @@ class ClipshareUI:
             self._action_msg = f"Pushed {item['kind']} from {item['source']} to clipboard"
         except Exception as exc:
             self._action_msg = f"Push failed: {exc}"
+
+    def _poll_prune(self) -> None:
+        try:
+            removed = self.store.prune(
+                self.config.retention_days, self.config.history_limit
+            )
+            if removed:
+                self._action_msg = f"Pruned {removed} old items"
+                self.refresh()
+        except Exception as exc:
+            self._action_msg = f"Prune failed: {exc}"
+        self.root.after(PRUNE_INTERVAL_MS, self._poll_prune)
 
     def _poll_status(self) -> None:
         peers = self.manager.status() if self.manager else []

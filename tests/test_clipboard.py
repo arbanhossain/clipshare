@@ -1,7 +1,12 @@
 import io
 import unittest
 
-from clipshare.clipboard import Clipboard, pick_image_target, to_png
+from clipshare.clipboard import (
+    Clipboard,
+    pick_image_target,
+    repair_mojibake,
+    to_png,
+)
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
 
@@ -115,6 +120,55 @@ class TestImageNormalisation(unittest.TestCase):
         big = b"\x89PNG\r\n\x1a\n" + b"0" * 4096
         cb = fake_clipboard({"image/png": big}, wayland=True, max_image_bytes=1024)
         self.assertEqual(cb.get().kind, "none")
+
+
+class TestEchoSuppression(unittest.TestCase):
+    def test_identical_echo_is_suppressed(self):
+        cb = fake_clipboard({}, wayland=True)
+        cb.set_text("hello")
+        from clipshare.store import digest
+        self.assertTrue(cb.is_echo(digest("hello")))
+
+    def test_mutated_echo_is_suppressed(self):
+        # A clipboard round trip can alter the text (encoding, line endings);
+        # the mutated read must not be treated as a fresh copy and bounced back.
+        cb = fake_clipboard({}, wayland=True)
+        cb.set_text("hello")
+        self.assertTrue(cb.is_echo("a-completely-different-digest"))
+
+    def test_user_copy_after_the_window_is_not_an_echo(self):
+        cb = fake_clipboard({}, wayland=True)
+        cb.set_text("hello")
+        cb._written_at -= 10  # pretend the write was 10s ago
+        self.assertFalse(cb.is_echo("a-completely-different-digest"))
+
+    def test_nothing_written_yet(self):
+        self.assertFalse(fake_clipboard({}, wayland=True).is_echo("whatever"))
+
+
+class TestMojibakeRepair(unittest.TestCase):
+    def test_repairs_latin1_read_of_utf8(self):
+        original = "আজকে আমার"
+        mangled = original.encode("utf-8").decode("latin-1")
+        self.assertEqual(repair_mojibake(mangled), original)
+
+    def test_leaves_ascii_and_real_text_alone(self):
+        for text in ("plain ascii", "café", "naïve", "日本語", ""):
+            self.assertEqual(repair_mojibake(text), text)
+
+    def test_repair_is_skipped_when_owner_offers_utf8(self):
+        original = "আজকে"
+        mangled = original.encode("utf-8").decode("latin-1")
+        cb = fake_clipboard({}, xclip="/usr/bin/xclip")
+        cb._read = lambda cmd: b"TARGETS\nUTF8_STRING\nSTRING"
+        self.assertEqual(cb._maybe_repair(mangled), mangled)
+
+    def test_repair_applies_for_string_only_owner(self):
+        original = "আজকে"
+        mangled = original.encode("utf-8").decode("latin-1")
+        cb = fake_clipboard({}, xclip="/usr/bin/xclip")
+        cb._read = lambda cmd: b"TARGETS\nSTRING"
+        self.assertEqual(cb._maybe_repair(mangled), original)
 
 
 class TestSetImage(unittest.TestCase):

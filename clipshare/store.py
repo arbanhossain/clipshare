@@ -81,34 +81,35 @@ class Store:
     def recent(self, limit: int = 200) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-            "SELECT id, hash, kind, text, source, created_at, pinned FROM items "
-            "ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+                "SELECT id, hash, kind, text, source, created_at, pinned FROM items "
+                "ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def search(self, query: str, limit: int = 200) -> list[dict]:
+        like = f"%{query}%"
         with self._lock:
-            like = f"%{query}%"
-        rows = self._conn.execute(
-            "SELECT id, hash, kind, text, source, created_at, pinned FROM items "
-            "WHERE kind = 'text' AND text LIKE ? ORDER BY created_at DESC LIMIT ?",
-            (like, limit),
-        ).fetchall()
+            rows = self._conn.execute(
+                "SELECT id, hash, kind, text, source, created_at, pinned FROM items "
+                "WHERE kind = 'text' AND text LIKE ? ORDER BY created_at DESC LIMIT ?",
+                (like, limit),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def delete(self, item_id: int) -> bool:
         with self._lock:
             cur = self._conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
-        self._conn.commit()
+            self._conn.commit()
         return cur.rowcount > 0
 
     def set_pinned(self, item_id: int, pinned: bool) -> bool:
         with self._lock:
             cur = self._conn.execute(
-            "UPDATE items SET pinned = ? WHERE id = ?", (1 if pinned else 0, item_id)
-        )
-        self._conn.commit()
+                "UPDATE items SET pinned = ? WHERE id = ?",
+                (1 if pinned else 0, item_id),
+            )
+            self._conn.commit()
         return cur.rowcount > 0
 
     def prune(self, retention_days: int, history_limit: int) -> int:

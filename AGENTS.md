@@ -9,7 +9,9 @@ Contributor guide for Clipshare, a Python app that syncs clipboard history
   - `clipboard.py` — X11 (tkinter text, `xclip` images) / Wayland (`wl-clipboard`)
     clipboard adapters; images are normalised to PNG before they reach the store
   - `store.py` — SQLite history with content-hash dedup
-  - `sync.py` — TCP sync protocol, UDP discovery, peer pairing
+  - `sync.py` — TCP sync protocol, UDP discovery, peer pairing; history
+    replay runs on its own thread per connection (both peers replay at
+    once, so neither may block in `sendall` before reading)
   - `ui.py`, `tray.py` — tkinter history window and pystray tray icon
   - `settings.py` — first-run setup wizard and settings dialog (token, peers, options)
   - `config.py`, `cli.py`, `__main__.py` — settings and entry points

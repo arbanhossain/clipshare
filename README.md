@@ -89,4 +89,9 @@ in `~/.local/share/clipshare/history.db`.
   (defaults 58321/58322) between the two machines.
 - A push is only applied locally if it's new content (hash dedup), so
   copy-triggered loops are impossible.
-- Unpinned history is pruned after 30 days / 500 entries (configurable).
+- Unpinned history is pruned after 30 days / 500 entries (configurable);
+  pruning runs at startup and every 15 minutes while the app is running.
+  Pruning frees rows, not disk — run `sqlite3 history.db VACUUM` to shrink
+  the file after a large cleanup.
+- On connect each peer replays its recent history, capped at 8 MB; live
+  copies are never affected by that cap.

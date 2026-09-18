@@ -19,6 +19,14 @@ MAX_MSG_BYTES = 32 * 1024 * 1024
 # are ~1.33x their blob size, so a fixed item count can overrun the limit.
 MAX_BATCH_BYTES = 4 * 1024 * 1024
 MAX_BATCH_ITEMS = 50
+# History replay is capped: a peer that has accumulated a huge history must not
+# spend every reconnect re-sending all of it.
+MAX_REPLAY_BYTES = 8 * 1024 * 1024
+PING_INTERVAL = 15
+
+
+class IdleTimeout(Exception):
+    """No message arrived, but the stream is still at a message boundary."""
 
 
 def encode_message(obj: dict) -> bytes:
@@ -30,11 +38,18 @@ def send_message(sock: socket.socket, obj: dict) -> None:
     sock.sendall(struct.pack(">I", len(data)) + data)
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
+def recv_exact(sock: socket.socket, n: int, idle_ok: bool = False) -> bytes:
     chunks = []
     remaining = n
     while remaining > 0:
-        chunk = sock.recv(min(65536, remaining))
+        try:
+            chunk = sock.recv(min(65536, remaining))
+        except socket.timeout:
+            # Only safe to shrug off before the first byte: a timeout mid-message
+            # would leave the stream desynchronised.
+            if idle_ok and not chunks:
+                raise IdleTimeout from None
+            raise
         if not chunk:
             raise ConnectionError("peer closed connection")
         chunks.append(chunk)
@@ -43,7 +58,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def recv_message(sock: socket.socket) -> dict:
-    header = recv_exact(sock, 4)
+    header = recv_exact(sock, 4, idle_ok=True)
     (length,) = struct.unpack(">I", header)
     if length > MAX_MSG_BYTES:
         raise ConnectionError("message too large")
@@ -91,6 +106,7 @@ class SyncManager:
         self.on_remote_item = on_remote_item or (lambda item: None)
         self._lock = threading.Lock()
         self._conns: set[socket.socket] = set()
+        self._send_locks: dict[socket.socket, threading.Lock] = {}
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._outbound: dict[str, threading.Thread] = {}
@@ -205,6 +221,7 @@ class SyncManager:
         items = self.store.recent(limit=self.config.history_limit)
         batch: list[dict] = []
         batch_bytes = 0
+        sent_bytes = 0
         for it in items:
             msg = self._row_to_message(it)
             if msg is None:
@@ -213,15 +230,20 @@ class SyncManager:
             if size > MAX_BATCH_BYTES and size + 1024 > MAX_MSG_BYTES:
                 log.warning("skipping oversized item %s (%d bytes)", it["hash"][:8], size)
                 continue
+            if sent_bytes + size > MAX_REPLAY_BYTES:
+                log.info("replay capped at %.1f MB; older history not sent",
+                         sent_bytes / 1048576)
+                break
             if batch and (
                 batch_bytes + size > MAX_BATCH_BYTES or len(batch) >= MAX_BATCH_ITEMS
             ):
-                send_message(sock, {"type": "items", "items": batch})
+                self._send(sock, {"type": "items", "items": batch})
                 batch, batch_bytes = [], 0
             batch.append(msg)
             batch_bytes += size
+            sent_bytes += size
         if batch:
-            send_message(sock, {"type": "items", "items": batch})
+            self._send(sock, {"type": "items", "items": batch})
 
     def _hello(self) -> dict:
         return {
@@ -247,7 +269,6 @@ class SyncManager:
                 if msg.get("type") != "hello" or msg.get("token") != self.config.token:
                     raise ConnectionError("bad handshake")
                 self.peers[msg["device_id"]] = (msg["name"], label)
-                self._send_recent(sock)
                 self._serve_conn(sock, label)
             except (OSError, ConnectionError, ValueError, json.JSONDecodeError) as exc:
                 log.debug("peer %s unreachable: %s", addr, exc)
@@ -298,7 +319,6 @@ class SyncManager:
             )
             label = f"in:{sock.getpeername()[0]}:{sock.getpeername()[1]}"
             self.peers[msg["device_id"]] = (msg["name"], label)
-            self._send_recent(sock)
             self._serve_conn(sock, label)
         except (OSError, ConnectionError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             log.debug("inbound connection ended: %s", exc)
@@ -309,13 +329,46 @@ class SyncManager:
 
     # -- shared connection loop ------------------------------------
 
+    def _send(self, sock: socket.socket, msg: dict) -> None:
+        """Serialise writes: the replay thread and broadcasts share one socket."""
+        with self._lock:
+            lock = self._send_locks.get(sock)
+        if lock is None:
+            send_message(sock, msg)
+            return
+        with lock:
+            send_message(sock, msg)
+
+    def _sender(self, sock: socket.socket, label: str, done: threading.Event) -> None:
+        """Replay history, then keep the connection warm."""
+        try:
+            self._send_recent(sock)
+            while not self._stop.is_set() and not done.is_set():
+                if done.wait(PING_INTERVAL):
+                    break
+                self._send(sock, {"type": "ping"})
+        except (OSError, ConnectionError, struct.error) as exc:
+            log.debug("sender for %s ended: %s", label, exc)
+
     def _serve_conn(self, sock: socket.socket, label: str) -> None:
+        # The replay runs in its own thread: both peers replay on connect, and
+        # if each blocks in sendall before reading, a history larger than the
+        # socket buffers deadlocks the pair until the timeout fires.
+        done = threading.Event()
         with self._lock:
             self._conns.add(sock)
             self.connected.add(label)
+            self._send_locks[sock] = threading.Lock()
+        sender = threading.Thread(
+            target=self._sender, args=(sock, label, done), daemon=True
+        )
+        sender.start()
         try:
             while not self._stop.is_set():
-                msg = recv_message(sock)
+                try:
+                    msg = recv_message(sock)
+                except IdleTimeout:
+                    continue
                 self._handle(msg, sock)
         except (
             ConnectionError,
@@ -326,13 +379,16 @@ class SyncManager:
         ) as exc:
             log.debug("connection %s ended: %s", label, exc)
         finally:
+            done.set()
             with self._lock:
                 self._conns.discard(sock)
                 self.connected.discard(label)
+                self._send_locks.pop(sock, None)
             try:
                 sock.close()
             except OSError:
                 pass
+            sender.join(timeout=1)
 
     # -- messages --------------------------------------------------
 
@@ -343,7 +399,7 @@ class SyncManager:
             conns = list(self._conns)
         for sock in conns:
             try:
-                send_message(sock, msg)
+                self._send(sock, msg)
             except (OSError, ConnectionError):
                 try:
                     sock.close()
@@ -359,7 +415,7 @@ class SyncManager:
         elif mtype in ("push", "items"):
             for it in msg.get("items", [msg]) if mtype == "items" else [msg]:
                 self._apply_push(it)
-        elif mtype == "ack":
+        elif mtype in ("ack", "ping"):
             pass
         else:
             log.debug("unknown message type %r", mtype)

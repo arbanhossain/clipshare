@@ -33,7 +33,9 @@ sed -e "s|@PYTHON@|${VENV}/bin/python|" \
     "${SRC}/scripts/clipshare.service" > "${SERVICE_DIR}/clipshare.service"
 
 systemctl --user daemon-reload
-systemctl --user enable --now clipshare.service
+systemctl --user enable clipshare.service
+# restart, not --now: an already-running daemon keeps serving the old code
+systemctl --user restart clipshare.service
 
 echo
 echo "Installed. Check status with:  systemctl --user status clipshare"

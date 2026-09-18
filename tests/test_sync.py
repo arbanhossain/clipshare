@@ -10,6 +10,7 @@ from clipshare.config import Config
 from clipshare.store import Store
 from clipshare.sync import (
     MAX_MSG_BYTES,
+    IdleTimeout,
     SyncManager,
     encode_message,
     recv_message,
@@ -164,6 +165,60 @@ class TestSync(unittest.TestCase):
         finally:
             sender.close()
             receiver.close()
+            store.close()
+
+    def test_large_history_does_not_stall(self):
+        """Both peers replay on connect; neither may block the other out."""
+        blob = "x" * 40000  # ~5 MB each side, past any socket buffer
+        store_a = Store(Path(self.tmp.name) / "la.db")
+        store_b = Store(Path(self.tmp.name) / "lb.db")
+        for i in range(125):
+            store_a.add("text", f"A{i}-{blob}", "laptop-a")
+            store_b.add("text", f"B{i}-{blob}", "laptop-b")
+        got_a, got_b = [], []
+        cfg_b = self._cfg("b", free_port())
+        cfg_a = self._cfg("a", free_port(), peers=[f"127.0.0.1:{cfg_b.port}"])
+        mgr_a = SyncManager(cfg_a, store_a, on_remote_item=lambda it: got_a.append(it))
+        mgr_b = SyncManager(cfg_b, store_b, on_remote_item=lambda it: got_b.append(it))
+        try:
+            mgr_b.start()
+            time.sleep(0.2)
+            mgr_a.start()
+            deadline = time.time() + 30
+            while time.time() < deadline and (len(got_a) < 125 or len(got_b) < 125):
+                time.sleep(0.1)
+            self.assertEqual(
+                (len(got_a), len(got_b)), (125, 125),
+                "history replay deadlocked: each peer blocked in sendall "
+                "before reading the other's replay",
+            )
+        finally:
+            mgr_a.stop()
+            mgr_b.stop()
+            store_a.close()
+            store_b.close()
+
+    def test_idle_socket_is_not_a_framing_error(self):
+        a, b = socket.socketpair()
+        b.settimeout(0.2)
+        with self.assertRaises(IdleTimeout):
+            recv_message(b)
+        # the stream is still usable afterwards
+        send_message(a, {"type": "ping"})
+        self.assertEqual(recv_message(b)["type"], "ping")
+        a.close()
+        b.close()
+
+    def test_ping_is_accepted(self):
+        cfg = self._cfg("a", free_port())
+        store = Store(Path(self.tmp.name) / "p.db")
+        mgr = SyncManager(cfg, store)
+        a, b = socket.socketpair()
+        try:
+            mgr._handle({"type": "ping"}, a)  # must not raise
+        finally:
+            a.close()
+            b.close()
             store.close()
 
     def test_auto_pair(self):

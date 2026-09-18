@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 import tkinter as tk
 from dataclasses import dataclass
 
@@ -35,6 +36,9 @@ IMAGE_TARGETS = (
 )
 # Modes Pillow can write straight to PNG; anything else gets converted.
 PNG_MODES = {"1", "L", "LA", "I", "P", "RGB", "RGBA"}
+# How long after we set the clipboard ourselves a capture still counts as our
+# own echo rather than a fresh copy by the user.
+ECHO_WINDOW_S = 2.0
 
 
 @dataclass
@@ -48,6 +52,21 @@ def _digest(payload: str | bytes) -> str:
     if isinstance(payload, str):
         payload = payload.encode("utf-8", "surrogatepass")
     return hashlib.sha256(payload).hexdigest()
+
+
+def repair_mojibake(text: str) -> str:
+    """Undo a latin-1 reading of UTF-8 bytes.
+
+    Owners that publish UTF-8 under the legacy STRING target come back from Tk
+    as mojibake; left alone it round-trips back onto the clipboard and grows on
+    every hop between machines.
+    """
+    if text.isascii():
+        return text
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
 
 
 def pick_text_target(types: list[str]) -> str | None:
@@ -111,6 +130,27 @@ class Clipboard:
             and shutil.which("wl-copy") is not None
         )
         self.xclip = shutil.which("xclip")
+        self._written_digest: str | None = None
+        self._written_at = 0.0
+
+    # -- echo suppression -------------------------------------------
+
+    def _note_written(self, payload: str | bytes) -> None:
+        self._written_digest = _digest(payload)
+        self._written_at = time.monotonic()
+
+    def is_echo(self, digest: str) -> bool:
+        """True when a capture is what we just wrote — possibly mangled.
+
+        A clipboard round trip is not always lossless (encoding, line endings),
+        so a mutated echo hashes differently and would otherwise look like a
+        fresh copy, bounce back to the peer, and mutate again.
+        """
+        if self._written_digest is None:
+            return False
+        if digest == self._written_digest:
+            return True
+        return (time.monotonic() - self._written_at) < ECHO_WINDOW_S
 
     # -- capability reporting ---------------------------------------
 
@@ -173,10 +213,31 @@ class Clipboard:
         if self.root is None:
             return Clip("none", "")
         try:
-            text = self.root.clipboard_get()
+            text = self.root.clipboard_get(type="UTF8_STRING")
         except tk.TclError:
+            try:
+                text = self.root.clipboard_get()
+            except tk.TclError:
+                return Clip("none", "")
+        if not text:
             return Clip("none", "")
-        return Clip("text", text) if text else Clip("none", "")
+        return Clip("text", self._maybe_repair(text))
+
+    def _maybe_repair(self, text: str) -> str:
+        """Repair text only when the owner never offered a UTF-8 target.
+
+        Tk hands back a latin-1 reading of UTF-8 bytes for STRING-only owners,
+        and that mangled text is what gets stored and sent to the peer. A
+        conformant owner's text is already correct and must be left alone, so
+        the targets are only consulted when the text looks double-encoded.
+        """
+        repaired = repair_mojibake(text)
+        if repaired == text:
+            return text
+        if "utf8_string" in {t.lower() for t in self._list_types()}:
+            return text
+        log.info("repaired latin-1 mojibake from a STRING-only clipboard owner")
+        return repaired
 
     def _text_clip(self, data: bytes | None) -> Clip:
         if not data:
@@ -217,6 +278,7 @@ class Clipboard:
 
     def set_text(self, text: str) -> None:
         data = text.encode("utf-8", "surrogatepass")
+        self._note_written(text)
         if self.wayland:
             if not self._write(["wl-copy", "--type", "text/plain"], data):
                 raise RuntimeError("wl-copy failed to set the clipboard")
@@ -233,6 +295,7 @@ class Clipboard:
         raise RuntimeError("no way to set the clipboard")
 
     def set_image(self, png_bytes: bytes) -> None:
+        self._note_written(png_bytes)
         if self.wayland:
             if not self._write(["wl-copy", "--type", "image/png"], png_bytes):
                 raise RuntimeError("wl-copy failed to set the image clipboard")
